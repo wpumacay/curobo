@@ -2,3 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 """Robot module containing kinematics, dynamics, and related types."""
+
+from enum import StrEnum
+
+
+class ModelFormat(StrEnum):
+    URDF = "urdf"
+    MJCF = "mjcf"

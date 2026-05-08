@@ -5,10 +5,8 @@
 kinematic tree of a robot.
 """
 
-# Standard Library
 from typing import Dict, List, Optional, Tuple, Union
 
-# Third Party
 import numpy as np
 import torch
 import yourdfpy
@@ -16,8 +14,6 @@ from lxml import etree
 
 from curobo._src.geom.types import Cuboid, Cylinder, Obstacle, Sphere
 from curobo._src.geom.types import Mesh as CuroboMesh
-
-# CuRobo
 from curobo._src.robot.parser.parser_base import RobotParser
 from curobo._src.robot.types.joint_types import JointType
 from curobo._src.robot.types.link_params import LinkParams
@@ -48,7 +44,8 @@ class UrdfRobotParser(RobotParser):
             build_scene_graph: Build scene graph for the robot. Set this to True if you want to
                 determine the root link of the robot.
         """
-        # load robot from urdf:
+        self._parent_map = {}
+
         self._mesh_root = mesh_root
 
         self._robot = yourdfpy.URDF.load(
@@ -74,6 +71,12 @@ class UrdfRobotParser(RobotParser):
                 "jid": jid,
                 "joint_name": j,
             }
+
+        if self.extra_links is not None and len(list(self.extra_links.keys())) > 0:
+            for i in self.extra_links:
+                self._parent_map[i] = {"parent": self.extra_links[i].parent_link_name}
+                if self.extra_links[i].child_link_name is not None:
+                    self._parent_map[self.extra_links[i].child_link_name]["parent"] = i
 
     def _get_joint_name(self, idx) -> str:
         """Get the name of the joint at the given index.
@@ -167,7 +170,9 @@ class UrdfRobotParser(RobotParser):
                 np.ravel([1, 0, 0, 0]),
                 device_cfg=DeviceCfg(device="cuda", dtype=torch.float32),
             )
-            com = com_rotation_as_pose.multiply(com_position_as_pose).position.view(3).cpu().numpy()
+            com = (
+                com_rotation_as_pose.multiply(com_position_as_pose).position.view(3).cpu().numpy()
+            )
 
             inertia_matrix = link_data.inertial.inertia
             inertia_array = np.array(
@@ -186,7 +191,9 @@ class UrdfRobotParser(RobotParser):
             if com.shape != (3,):
                 log_and_raise(f"com read from urdf shape does not match: {com.shape} != (3,)")
             if inertia.shape != (6,):
-                log_and_raise(f"inertia read from urdf shape does not match: {inertia.shape} != (6,)")
+                log_and_raise(
+                    f"inertia read from urdf shape does not match: {inertia.shape} != (6,)"
+                )
 
         mimic_joint_name = None
         if base:
@@ -232,7 +239,9 @@ class UrdfRobotParser(RobotParser):
                         active_joint_limits["lower"] * joint_offset[0] + joint_offset[1]
                         < joint_limits["lower"]
                     ):
-                        new_value = active_joint_limits["lower"] * joint_offset[0] + joint_offset[1]
+                        new_value = (
+                            active_joint_limits["lower"] * joint_offset[0] + joint_offset[1]
+                        )
                         log_warn(
                             "mimic joint can go out of it's lower limit as active joint has larger range "
                             + "FIX: make mimic joint ["
@@ -247,7 +256,9 @@ class UrdfRobotParser(RobotParser):
                         active_joint_limits["upper"] * joint_offset[0] + joint_offset[1]
                         > joint_limits["upper"]
                     ):
-                        new_value = active_joint_limits["upper"] * joint_offset[0] + joint_offset[1]
+                        new_value = (
+                            active_joint_limits["upper"] * joint_offset[0] + joint_offset[1]
+                        )
                         log_warn(
                             "mimic joint can go out of it's upper limit as active joint has larger range "
                             + "FIX: make mimic joint [ "
@@ -258,7 +269,10 @@ class UrdfRobotParser(RobotParser):
                         )
                         joint_limits["upper"] = new_value + 1e-3
 
-                    if active_joint_limits["velocity"] * joint_offset[0] > joint_limits["velocity"]:
+                    if (
+                        active_joint_limits["velocity"] * joint_offset[0]
+                        > joint_limits["velocity"]
+                    ):
                         new_value = active_joint_limits["velocity"] * joint_offset[0]
                         log_warn(
                             "mimic joint can move at higher velocity than active joint,"
@@ -339,8 +353,10 @@ class UrdfRobotParser(RobotParser):
         """Get the contents of URDF as a string."""
         txt = etree.tostring(self._robot.write_xml(), method="xml", encoding="unicode")
         return txt
-    def get_link_geometry(self, link_name: str,
-                          use_collision_mesh: bool = False) -> List[Obstacle]:
+
+    def get_link_geometry(
+        self, link_name: str, use_collision_mesh: bool = False
+    ) -> List[Obstacle]:
         """Get geometry of a link.
 
         Args:
@@ -374,7 +390,14 @@ class UrdfRobotParser(RobotParser):
             elif geometry.sphere is not None:
                 geometry_list.append(Sphere(name=name, pose=origin, radius=geometry.sphere.radius))
             elif geometry.cylinder is not None:
-                geometry_list.append(Cylinder(name=name, pose=origin, radius=geometry.cylinder.radius, height=geometry.cylinder.length))
+                geometry_list.append(
+                    Cylinder(
+                        name=name,
+                        pose=origin,
+                        radius=geometry.cylinder.radius,
+                        height=geometry.cylinder.length,
+                    )
+                )
             elif geometry.mesh is not None:
                 local_path = geometry.mesh.filename
                 absolute_path = self._file_name_handler(local_path)
@@ -382,6 +405,7 @@ class UrdfRobotParser(RobotParser):
             else:
                 continue
         return geometry_list
+
     def get_link_mesh(
         self, link_name: str, use_collision_mesh: bool = False
     ) -> Union[CuroboMesh, None]:
@@ -437,6 +461,36 @@ class UrdfRobotParser(RobotParser):
             file_path=absolute_path,
         )
 
+    def get_chain(self, base_link: str, ee_link: str) -> List[str]:
+        """Get list of links attaching ee_link to base_link.
+
+        Args:
+            base_link (str): Name of base link.
+            ee_link (str): Name of end-effector link.
+
+        Returns:
+            List[str]: List of link names starting from base_link to ee_link.
+        """
+        chain_links = [ee_link]
+        link = ee_link
+        while link != base_link:
+            if link not in self._parent_map:
+                log_and_raise(f"Link {link} not found in parent map {self._parent_map}")
+            link = self._parent_map[link]["parent"]
+            # add link to chain:
+            chain_links.append(link)
+        chain_links.reverse()
+        return chain_links
+
+    def get_controlled_joint_names(self) -> list[str]:
+        j_list = []
+        for k in self._parent_map.keys():
+            joint_name = self._parent_map[k]["joint_name"]
+            joint = self._robot.joint_map[joint_name]
+            if joint.type != "fixed" and joint.mimic is None:
+                j_list.append(joint_name)
+        return j_list
+
     @property
     def root_link(self) -> str:
         """Returns the name of the base link of the robot.
@@ -448,7 +502,7 @@ class UrdfRobotParser(RobotParser):
         """
         return self._robot.base_link
 
-    def get_link_names_from_urdf(self) -> List[str]:
+    def get_link_names(self) -> list[str]:
         """Get names of all links in the kinematic tree from the URDF.
 
         Returns:
@@ -456,7 +510,7 @@ class UrdfRobotParser(RobotParser):
         """
         return list(self._robot.link_map.keys())
 
-    def get_joint_names_from_urdf(self) -> List[str]:
+    def get_joint_names(self) -> list[str]:
         """Get names of all joints in the kinematic tree from the URDF.
 
         Returns:
@@ -464,3 +518,18 @@ class UrdfRobotParser(RobotParser):
         """
         # exclude
         return list(self._robot.joint_map.keys())
+
+    def _get_from_extra_links(self, link_name: str) -> LinkParams | None:
+        """Get link parameters for extra links.
+
+        Args:
+            link_name: Name of the link.
+
+        Returns:
+            LinkParams: Link parameters if found, else None.
+        """
+        if self.extra_links is None:
+            return None
+        if link_name in self.extra_links.keys():
+            return self.extra_links[link_name]
+        return None

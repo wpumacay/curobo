@@ -75,16 +75,15 @@ class KinematicsLoaderCfg:
     #: Set this to true to add mesh_link_names to tool_frames when computing kinematics.
     load_tool_frames_with_mesh: bool = False
 
-    #: Path to load robot urdf.
-    urdf_path: Optional[str] = None
-
+    #: Path to load robot model
+    model_path: Optional[str] = None
 
     #: Lock active joints in the kinematic tree. This will convert the joint to a fixed joint with
     #: joint angle given from this dictionary.
     lock_joints: Optional[Dict[str, float]] = None
 
     #: Additional links to add to parsed kinematics tree. This is useful for adding fixed links
-    #: that are not present in the URDF or USD.
+    #: that are not present in the URDF, MJCF or USD.
     extra_links: Optional[Dict[str, LinkParams]] = None
 
     #: Deprecated way to add a fixed link.
@@ -138,12 +137,12 @@ class KinematicsLoaderCfg:
             log_warn("Deprecated: external_robot_configs_path is deprecated, use ContentPath")
             robot_path = self.external_robot_configs_path
 
-        if self.urdf_path is not None:
-            self.urdf_path = join_path(asset_path, self.urdf_path)
+        if self.model_path is not None:
+            self.model_path = join_path(asset_path, self.model_path)
         if self.asset_root_path != "":
             self.asset_root_path = join_path(asset_path, self.asset_root_path)
-        elif self.urdf_path is not None:
-            self.asset_root_path = os.path.dirname(self.urdf_path)
+        elif self.model_path is not None:
+            self.asset_root_path = os.path.dirname(self.model_path)
 
         if not self.load_collision_spheres:
             self.collision_spheres = None
@@ -197,4 +196,3 @@ class KinematicsLoaderCfg:
 
         if self.grasp_contact_link_names is not None:
             self.grasp_contact_link_names = copy.deepcopy(self.grasp_contact_link_names)
-

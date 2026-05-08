@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
-"""High-level API for building and editing robot model configurations from URDF files.
+"""High-level API for building and editing robot model configurations from URDF or MJCF files.
 
 This module provides :class:`RobotBuilder` for creating cuRobo robot configurations
 with collision spheres and optimized self-collision matrices.
@@ -20,11 +20,14 @@ from curobo._src.cost.cost_self_collision import SelfCollisionCost
 from curobo._src.cost.cost_self_collision_cfg import SelfCollisionCostCfg
 from curobo._src.geom.sphere_fit.fit_spheres import fit_spheres_to_mesh
 from curobo._src.geom.sphere_fit.types import SphereFitMetrics, SphereFitType
+from curobo._src.robot import ModelFormat
 from curobo._src.robot.kinematics.kinematics import Kinematics
 from curobo._src.robot.kinematics.kinematics_cfg import KinematicsCfg
 from curobo._src.state.state_joint import JointState
 from curobo._src.robot.loader.kinematics_loader_cfg import KinematicsLoaderCfg
+from curobo._src.robot.parser.parser_base import RobotParser
 from curobo._src.robot.parser.parser_urdf import UrdfRobotParser
+from curobo._src.robot.parser.parser_mjcf import MjcfRobotParser
 from curobo._src.types.content_path import ContentPath
 from curobo._src.types.device_cfg import DeviceCfg
 from curobo._src.util.logging import log_and_raise, log_info, log_warn
@@ -36,22 +39,22 @@ from curobo.content import get_assets_path, get_robot_configs_path
 
 
 class RobotBuilder:
-    """Build and edit robot model configurations from URDF files.
+    """Build and edit robot model configurations from URDF or MJCF files.
 
     This class provides a high-level interface for creating cuRobo robot configurations.
     It handles:
 
-    - Loading URDF files and parsing kinematic structure
+    - Loading URDF or MJCF files and parsing kinematic structure
     - Fitting collision spheres to robot link meshes
     - Computing optimized self-collision ignore matrices
     - Generating and saving cuRobo-compatible configuration files
     - Interactive visualization with Viser
 
-    The builder supports both creating new configurations from URDF and editing existing
+    The builder supports both creating new configurations from URDF|MJCF and editing existing
     configurations (e.g., refitting spheres for specific links).
 
     Typical workflow for creating new robot:
-        1. Initialize with URDF path
+        1. Initialize with model path
         2. Fit collision spheres
         3. Compute collision matrix
         4. Build configuration
@@ -101,46 +104,53 @@ class RobotBuilder:
 
     def __init__(
         self,
-        urdf_path: str,
+        model_path: str,
         asset_path: str = "",
         tool_frames: Optional[List[str]] = None,
         device_cfg: Optional[DeviceCfg] = None,
+        model_format: ModelFormat = ModelFormat.URDF,
     ):
-        """Initialize robot model builder from URDF file.
+        """Initialize robot model builder from model file.
 
         Args:
-            urdf_path: Path to URDF file.
+            model_path: Path to model file (URDF|MJCF).
             asset_path: Path to mesh assets directory (for resolving relative mesh paths in URDF).
-            base_link: Robot base link name. If None, auto-detected from URDF root.
+            base_link: Robot base link name. If None, auto-detected from model root.
             device_cfg: Device configuration for CUDA operations. Defaults to CUDA:0.
         """
+        self._model_format = model_format
         self.device_cfg = device_cfg or DeviceCfg()
 
-        # Resolve to absolute paths for URDF parsing
-        abs_urdf = str(Path(urdf_path).resolve())
+        # Resolve to absolute paths for model parsing
+        abs_model = str(Path(model_path).resolve())
         abs_asset = str(Path(asset_path).resolve()) if asset_path else ""
 
         # Store paths relative to assets dir so KinematicsLoaderCfg doesn't double-prefix
         assets_root = str(get_assets_path())
-        if abs_urdf.startswith(assets_root + "/"):
-            self.urdf_path = abs_urdf[len(assets_root) + 1 :]
+        if abs_model.startswith(assets_root + "/"):
+            self.model_path = abs_model[len(assets_root) + 1 :]
         else:
-            self.urdf_path = abs_urdf
+            self.model_path = abs_model
         if abs_asset and abs_asset.startswith(assets_root + "/"):
             self.asset_path = abs_asset[len(assets_root) + 1 :]
         else:
             self.asset_path = abs_asset
 
-        # Parse URDF
-        self._parser = UrdfRobotParser(
-            abs_urdf,
-            load_meshes=True,
-            mesh_root=abs_asset,
-            build_scene_graph=True,
-        )
+        # Parse model
+        self._parser: RobotParser | None = None
+        match self._model_format:
+            case ModelFormat.URDF:
+                self._parser = UrdfRobotParser(
+                    abs_model,
+                    load_meshes=True,
+                    mesh_root=abs_asset,
+                    build_scene_graph=True,
+                )
+            case ModelFormat.MJCF:
+                self._parser = MjcfRobotParser(abs_model)
 
         # Extract robot structure
-        self._link_names = self._parser.get_link_names_from_urdf()
+        self._link_names = self._parser.get_link_names()
 
         # store links that have meshes seperately:
         self._mesh_link_names = [
@@ -149,9 +159,7 @@ class RobotBuilder:
             if len(self._parser.get_link_geometry(link_name)) > 0
         ]
         self._joint_names = [
-            j
-            for j in self._parser.get_joint_names_from_urdf()
-            if j not in self._link_names
+            j for j in self._parser.get_joint_names() if j not in self._link_names
         ]
         self._base_link = self._parser.root_link
         self._tool_frames = tool_frames or self._link_names[-1:]
@@ -203,27 +211,30 @@ class RobotBuilder:
         kinematics_data = config_data["kinematics"]
 
         # Create instance from existing config
-        urdf_path = join_path(get_assets_path(), kinematics_data["urdf_path"])
+        model_path = join_path(get_assets_path(), kinematics_data["model_path"])
         asset_path = join_path(get_assets_path(), kinematics_data.get("asset_root_path", ""))
 
         tool_frames = kinematics_data.get("tool_frames", None)
-        instance = cls(urdf_path=urdf_path, asset_path=asset_path, tool_frames=tool_frames, device_cfg=device_cfg)
+        instance = cls(
+            model_path=model_path,
+            asset_path=asset_path,
+            tool_frames=tool_frames,
+            device_cfg=device_cfg,
+        )
 
         # Load existing collision data
         if "collision_spheres" in kinematics_data:
             if isinstance(kinematics_data["collision_spheres"], str):
-                kinematics_data["collision_spheres"] = load_yaml(join_path(get_robot_configs_path(), kinematics_data["collision_spheres"]))
+                kinematics_data["collision_spheres"] = load_yaml(
+                    join_path(get_robot_configs_path(), kinematics_data["collision_spheres"])
+                )
             instance._collision_spheres = kinematics_data["collision_spheres"].copy()
 
         if "self_collision_ignore" in kinematics_data:
-            instance._self_collision_ignore = kinematics_data[
-                "self_collision_ignore"
-            ].copy()
+            instance._self_collision_ignore = kinematics_data["self_collision_ignore"].copy()
 
         if "self_collision_buffer" in kinematics_data:
-            instance._self_collision_buffer = kinematics_data[
-                "self_collision_buffer"
-            ].copy()
+            instance._self_collision_buffer = kinematics_data["self_collision_buffer"].copy()
 
         if "cspace" in kinematics_data:
             instance._cspace_config = kinematics_data["cspace"].copy()
@@ -334,9 +345,7 @@ class RobotBuilder:
                 collision_spheres[link_name] = spheres
                 total_spheres += len(spheres)
 
-        log_info(
-            f"Fitted {total_spheres} collision spheres across {len(collision_spheres)} links"
-        )
+        log_info(f"Fitted {total_spheres} collision spheres across {len(collision_spheres)} links")
 
         self._collision_spheres = collision_spheres
         return collision_spheres
@@ -467,9 +476,7 @@ class RobotBuilder:
             ... )
         """
         if self._collision_spheres is None:
-            log_and_raise(
-                "Must call fit_collision_spheres() before compute_collision_matrix()"
-            )
+            log_and_raise("Must call fit_collision_spheres() before compute_collision_matrix()")
 
         # Step 1: Create ignore matrix for neighboring links
         log_info("Creating collision ignore matrix for neighboring links...")
@@ -487,16 +494,16 @@ class RobotBuilder:
         log_info("Checking for collisions at default joint configuration...")
         num_added = self._check_default_joint_configuration_collisions(temp_config)
         if num_added > 0:
-            log_info(f"Added {num_added} pairs that collide at default joint configuration to ignore matrix")
+            log_info(
+                f"Added {num_added} pairs that collide at default joint configuration to ignore matrix"
+            )
             # Rebuild config with updated ignore matrix
             temp_config = self._build_temp_config()
 
         # Step 5: Prune never-colliding pairs (optional)
         if prune_collisions:
             log_info("Pruning never-colliding link pairs via sampling...")
-            num_pruned = self._prune_collision_pairs(
-                temp_config, num_samples, batch_size, seed
-            )
+            num_pruned = self._prune_collision_pairs(temp_config, num_samples, batch_size, seed)
             log_info(f"Pruned {num_pruned} never-colliding link pairs")
 
         return self._self_collision_ignore
@@ -547,10 +554,7 @@ class RobotBuilder:
             >>> builder.remove_collision_ignore("link_1", ["link_5"])
             >>> # Now link_1 WILL be checked against link_5
         """
-        if (
-            self._self_collision_ignore is None
-            or link_name not in self._self_collision_ignore
-        ):
+        if self._self_collision_ignore is None or link_name not in self._self_collision_ignore:
             return
 
         for ignore_link in ignore_links:
@@ -592,13 +596,12 @@ class RobotBuilder:
             log_warn("Building robot configuration without computing collision matrix.")
             self._self_collision_ignore = self._create_neighbor_ignore_matrix()
 
-
         collision_link_names = list(self._collision_spheres.keys())
 
         config = KinematicsLoaderCfg(
             base_link=self._base_link,
             tool_frames=self._tool_frames,
-            urdf_path=self.urdf_path,
+            model_path=self.model_path,
             asset_root_path=self.asset_path,
             collision_link_names=collision_link_names,
             collision_spheres=self._collision_spheres,
@@ -639,9 +642,7 @@ class RobotBuilder:
             else:
                 # Generate cspace from config
                 try:
-                    robot_model_config = KinematicsCfg.from_data_dict(
-                        data_dict["kinematics"]
-                    )
+                    robot_model_config = KinematicsCfg.from_data_dict(data_dict["kinematics"])
                     cspace_config = robot_model_config.kinematics_config.cspace
                     cspace_dict = vars(cspace_config).copy()
 
@@ -710,9 +711,7 @@ class RobotBuilder:
         else:
             # Generate cspace from config
             try:
-                robot_model_config = KinematicsCfg.from_data_dict(
-                    config_dict["kinematics"]
-                )
+                robot_model_config = KinematicsCfg.from_data_dict(config_dict["kinematics"])
                 cspace_config = robot_model_config.kinematics_config.cspace
                 cspace_dict = vars(cspace_config).copy()
 
@@ -796,7 +795,6 @@ class RobotBuilder:
 
         # Add meshes if requested
         if show_meshes and self._collision_spheres:
-
             time.sleep(1.0)  # Give Viser time to initialize
 
             for link_name in self._collision_spheres.keys():
@@ -884,7 +882,8 @@ class RobotBuilder:
         fitting, so spheres are distributed coherently across the whole link.
         """
         geometry_list = self._parser.get_link_geometry(
-            link_name, use_collision_mesh=use_collision_mesh,
+            link_name,
+            use_collision_mesh=use_collision_mesh,
         )
         if not geometry_list:
             return None
@@ -976,7 +975,7 @@ class RobotBuilder:
         temp_gen_config = KinematicsLoaderCfg(
             base_link=self._base_link,
             tool_frames=self._tool_frames,
-            urdf_path=self.urdf_path,
+            model_path=self.model_path,
             asset_root_path=self.asset_path,
             collision_link_names=list(self._collision_spheres.keys()),
             collision_spheres=self._collision_spheres,
